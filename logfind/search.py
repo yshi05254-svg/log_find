@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Deque, Iterable, Iterator, List, Optional, Sequence
 
-from .parsing import parse_level, parse_timestamp
+from .parsing import parse_level, parse_timestamp, strip_archive_prefix
 from .textio import LineSplitter, detect_encoding, looks_binary, open_any
+from .timeline import build_timeline
 
 # 常见“崩溃/被吞掉的错误”特征
 PRESETS = {
@@ -24,6 +25,13 @@ PRESETS = {
     ],
     "error": [r"(?i)\b(error|err|fatal|critical|fail(ed|ure)?|exception)\b"],
     "warn": [r"(?i)\b(warn(ing)?|deprecated)\b"],
+    # Android：Java 崩溃、ANR、native 崩溃（tombstone）、system_server 重启、看门狗
+    "android": [
+        r"FATAL EXCEPTION", r"\bANR in\b", r"Fatal signal \d+", r"\*\*\* \*\*\* \*\*\*", r"\bam_crash\b",
+        r"\bam_anr\b", r"beginning of crash", r"\bWATCHDOG KILLING\b", r"Force finishing activity",
+        r"\bsystem_server\b.*\b(died|crash)", r"Abort message:", r"\bnative_crash\b",
+    ],
+    "selinux": [r"avc: +denied"],
 }
 
 LOG_EXTS = (".log", ".txt", ".out", ".err", ".jsonl", ".gz", ".bz2", ".xz", ".csv", ".trace")
@@ -37,6 +45,9 @@ class Record:
     lines: List[str]
     ts: Optional[datetime] = None
     level: Optional[int] = None
+    uptime: Optional[float] = None   # 开机后秒数（clock_fix 模式）
+    boot: Optional[int] = None       # 文件内第几次开机（clock_fix 模式）
+    boots: Optional[int] = None      # 文件内开机总次数
 
     @property
     def text(self) -> str:
@@ -131,8 +142,12 @@ def iter_lines(path: str, encoding: str = "auto") -> Iterator[str]:
 
 
 def iter_records(path: str, encoding: str = "auto", multiline: bool = True,
-                 max_record_lines: int = 400) -> Iterator[Record]:
-    """把行组合成记录：带时间戳的行开始新记录，无时间戳的后续行（如异常栈）归入上一条。"""
+                 max_record_lines: int = 400, clock_fix: bool = False) -> Iterator[Record]:
+    """把行组合成记录：带时间戳的行开始新记录，无时间戳的后续行（如异常栈）归入上一条。
+
+    clock_fix=True 时先扫描一遍文件（见 timeline.py），给每条记录算出开机分段、开机后秒数，
+    并把 ts 换成校正时钟跳变后的时间；会话归档里的行按设备原始时间（而不是主机到达时间）计算。
+    """
     try:
         ref = datetime.fromtimestamp(os.path.getmtime(path))
     except OSError:
@@ -143,6 +158,13 @@ def iter_records(path: str, encoding: str = "auto", multiline: bool = True,
                 return
     except (OSError, EOFError):
         return
+    cursor = None
+    if clock_fix:
+        try:
+            timeline = build_timeline(iter_lines(path, encoding), ref)
+            cursor = timeline.cursor()
+        except (OSError, EOFError):
+            cursor = None
     cur: Optional[Record] = None
     seen_ts = False
     try:
@@ -157,6 +179,12 @@ def iter_records(path: str, encoding: str = "auto", multiline: bool = True,
                 if cur is not None:
                     yield cur
                 cur = Record(path, lineno, [line], ts, parse_level(line))
+                if cursor is not None:
+                    body = strip_archive_prefix(line)
+                    dev_ts = ts if body is line else parse_timestamp(body, ref)
+                    cur.boot, cur.uptime, fixed = cursor.resolve(lineno, dev_ts)
+                    cur.boots = cursor.total
+                    cur.ts = fixed if fixed is not None else (None if body is not line else ts)
             else:
                 cur.lines.append(line)
                 if cur.level is None:
@@ -199,8 +227,24 @@ class Filters:
     until: Optional[datetime] = None
     min_level: Optional[int] = None
     max_level: Optional[int] = None
+    uptime_min: Optional[float] = None
+    uptime_max: Optional[float] = None
+    boot: Optional[int] = None  # 1 = 第一次开机，-1 = 最后一次
 
     def accept(self, r: Record) -> bool:
+        if self.boot is not None:
+            if r.boot is None:
+                return False
+            want = self.boot if self.boot > 0 else (r.boots or 0) + 1 + self.boot
+            if r.boot != want:
+                return False
+        if self.uptime_min is not None or self.uptime_max is not None:
+            if r.uptime is None:
+                return False
+            if self.uptime_min is not None and r.uptime < self.uptime_min:
+                return False
+            if self.uptime_max is not None and r.uptime > self.uptime_max:
+                return False
         if self.since or self.until:
             if r.ts is None:
                 return False
@@ -251,7 +295,7 @@ def search_records(records: Iterable[Record], matcher: Matcher, filters: Optiona
 
 def search(paths: Sequence[str], matcher: Matcher, filters: Optional[Filters] = None,
            before: int = 0, after: int = 0, max_count: int = 0, encoding: str = "auto",
-           multiline: bool = True) -> Iterator[Hit]:
+           multiline: bool = True, clock_fix: bool = False) -> Iterator[Hit]:
     for p in paths:
-        yield from search_records(iter_records(p, encoding, multiline), matcher, filters,
+        yield from search_records(iter_records(p, encoding, multiline, clock_fix=clock_fix), matcher, filters,
                                   before, after, max_count)

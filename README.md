@@ -10,6 +10,11 @@
 | 快照**读到一半** | 读的时候对方还在写 | 等文件大小/mtime 稳定、并校验 JSON 完整性后再拷贝；写快照用临时文件加 rename，保证原子性 |
 | 快照**难对比** | JSON 结构大、浮点向量逐元素对比会刷屏 | 结构化 JSON diff；长数值数组给出汇总（不同元素个数、最大差、NaN 个数）；支持容差 `--tol`；`.npy` 对比（需要 numpy） |
 | 编码乱码 | Windows 工具输出 GBK、UTF-16 | 自动识别 UTF-8 / GBK(GB18030) / UTF-16 / UTF-32，逐行回退解码，永不因编码报错 |
+| Android 开机日志**被冲掉** | system_server / phone 启动每秒数千行，`logcat -d` 时开机头 20 秒已被环形缓冲覆盖 | `adb bootlog`：在 post-fs-data 阶段（zygote 之前）启动常驻 logcat 写文件，日志在被冲掉之前就已落盘 |
+| `logcat -G` **重启失效** | 缓冲大小只在当次开机有效 | 开机脚本每次开机重新 `-G`，并设置 `persist.logd.size`；`adb logcat -G` 每次重启后重连时重做 |
+| 重启时 **adb 断开** | adbd 掉线，`adb logcat` exit 255 | `adb logcat` 自动等待设备、按 boot_id 判断是否重启：重启了从新缓冲开头抓，没重启用 `-T` 续接并去重 |
+| **SELinux 拒绝** / pull 被拒 | su shell 读不了 `/data/adb`、`/data/system`；`cp` 保留 root 上下文导致 pull 失败 | `adb pull` 用 `exec-out su -c 'tar -cf - ...'` 直接流回主机，设备上不落中间文件；失败时给出 su 上下文和 avc 拒绝记录，可选 `--setenforce0` |
+| 设备**时钟跳变** | RTC 未同步，开机阶段是 06-05 纪元时间，联网后跳变，按时间过滤切错窗口 | 定期写入 `logfind_clock` 时钟锚点；`grep --uptime 0-20s` 按开机后秒数过滤、`--fix-clock` 校正墙钟、`--boot N` 按开机分段 |
 
 纯 Python 标准库实现，无第三方依赖，支持 Python 3.8+，兼容 Linux / macOS / Windows。被监控的程序可以用任何语言编写（C++、Python、Rust 等都行）。
 
@@ -48,6 +53,35 @@ logfind snap diff --live              # 最新快照 对 磁盘上当前文件
 logfind snap watch out/vector/ -i 0.5 # 文件一变化就自动快照（未变的文件用硬链接，不占空间）
 logfind snap show prev state.json
 ```
+
+## Android：开机日志、跨重启、SELinux、时钟跳变
+
+需要 PC 上有 `adb`。`bootlog` 和 `pull` 需要设备已 root（Magisk / KernelSU / APatch），并允许 Shell 的超级用户请求。
+
+```bash
+# 1. 开机即落盘（一次安装，之后每次开机自动生效；重启前装好，开机头 20 秒就不会丢）
+logfind adb bootlog install -G 16M          # 安装 post-fs-data 脚本 + persist.logd.size，并立即抓本次开机
+adb reboot
+logfind adb bootlog status                  # 各次开机的目录、大小、boot_id、开机原因
+logfind adb bootlog pull                    # 拉回 .logfind/android/<序列号>/boot-NNNN_<boot_id>/
+logfind grep --uptime 0-20s -e LSPosed -e Xposed .logfind/android/*/boot-0003_*/
+
+# 2. 实时抓，设备重启后自动重连（不需要 root）
+logfind adb logcat -G 16M --preset android -t 'LSPosed'
+logfind grep --session latest --boot -1 --uptime 0-20s hook   # 最后一次开机的头 20 秒
+
+# 3. 读取受 SELinux 限制的目录
+logfind adb pull /data/adb/lspd/log /data/system/packages.xml
+logfind adb pull --setenforce0 /data/system/xxx               # 仍被拦截时：拉取期间临时宽容，结束后恢复
+```
+
+几点说明：
+
+- **为什么开机日志不会再被冲掉**：脚本在 post-fs-data 阶段运行，这时 zygote 和 system_server 还没有启动。它先执行 `logcat -G`，再启动一个常驻的 `logcat -f`，从 logd 缓冲的开头开始读，并持续写入 `/data/local/tmp/logfind/boot-NNNN/logcat.txt`（按 `--rotate-kb` 和 `--rotate-count` 分卷）。开机洪峰只能冲掉 logd 内存缓冲里的内容，已经写进文件的冲不掉。每次开机的目录里还有 `boot.txt`（boot_id、开机原因、fingerprint）、`dmesg-early.txt`，以及上次开机遗留的 pstore/ramoops。设备上只保留最近 `--keep` 次开机。
+- **时钟跳变**：脚本和 `adb logcat` 会定期往日志里写一行 `logfind_clock: boot_id=... up=<开机秒数>`（开机脚本在开机头 2 分钟每 2 秒写一次，之后每 10 秒一次；`adb logcat` 每 10 秒一次，可用 `--anchor` 调整）。检索时据此把每行换算成开机后秒数，这个值不受 RTC 跳变影响。没有锚点的旧日志会退化为启发式：相邻两行时间倒退超过 2 秒或前跳超过 10 分钟就视为跳变，此时的“开机后秒数”是从本次开机第一行日志算起的近似值。`grep --fix-clock --json` 会输出每行的 `boot` 和 `uptime`。
+- **`-T` 续接**：只有确认还是同一次开机（boot_id 相同）时才用 `-T` 续接；设备重启过就从新缓冲开头抓，尽量多拿开机阶段的日志。
+- `logfind adb bootlog script` 只打印将要安装的脚本内容，不连接设备；`uninstall --purge --reset-size` 会删除脚本、停止抓取、删除设备上的日志，并清除 `persist.logd.size`。
+- 内置规则：`--preset android`（FATAL EXCEPTION、ANR、Fatal signal、tombstone、看门狗等）、`--preset selinux`（avc: denied）。
 
 ## 配置文件（按模块分 profile）
 
@@ -134,6 +168,10 @@ for hit in search(expand_paths(["logs/"], rotated=True), Matcher(["dimension"]),
 | `grep [PATTERN] [PATHS] [-e RE] [-C N] [--since] [--until] [-l LEVEL] [-s SESSION] [--json]` | 检索 |
 | `sessions [--prune KEEP]` / `show [REF] [--stream] [-n] [--meta]` / `hits [REF] [--cat]` | 会话管理 |
 | `snap take/list/show/diff/watch/prune` | 快照 |
+| `adb logcat [-G SIZE] [-b BUF] [-t RE] [-- LOGCAT参数]` | 流式抓 logcat，设备重启后自动重连 |
+| `adb bootlog install/status/pull/uninstall/script` | 开机即落盘（需要 root） |
+| `adb pull REMOTE... [--setenforce0]` | exec-out + su + tar 拉取受限目录 |
+| `grep --fix-clock / --uptime 0-20s / --boot N` | 校正时钟跳变、按开机后秒数过滤、按开机分段过滤 |
 | `init` | 生成示例配置 |
 
 会话和快照的引用写法：`latest`、`prev`、`-3`（倒数第 3 个）、ID 前缀。

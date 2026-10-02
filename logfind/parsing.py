@@ -45,7 +45,10 @@ _LEVEL_WORD = re.compile(
     r"(?<![A-Za-z])(TRACE|VERBOSE|DEBUG|INFO|NOTICE|WARNING|WARN|ERROR|ERR|CRITICAL|CRIT|FATAL|PANIC|ALERT|EMERG)(?![A-Za-z])",
     re.IGNORECASE,
 )
-_LEVEL_LOGCAT = re.compile(r"^\S+\s+\S+\s+\d+\s+\d+\s+([VDIWEFA])\s")
+# threadtime，可带 -v year / -v uid（多出一列 uid，可能是 system / u0_a123 这样的名字）
+_LEVEL_LOGCAT = re.compile(r"^\S+\s+\S+\s+(?:\S+\s+)?\d+\s+\d+\s+([VDIWEFA])\s")
+# logfind 会话归档的行前缀：2026-10-02T20:22:01.123 [source]
+_ARCHIVE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} \[[^\]]*\] ?")
 _LEVEL_LOGCAT_BRIEF = re.compile(r"^([VDIWEFA])/[^\s(]+\s*\(")
 
 
@@ -82,7 +85,14 @@ def parse_timestamp(line: str, ref: Optional[datetime] = None) -> Optional[datet
     return None
 
 
+def strip_archive_prefix(line: str) -> str:
+    """去掉 logfind 归档加的“主机时间 [来源]”前缀，得到原始行（例如设备上的 logcat 行）。"""
+    m = _ARCHIVE_PREFIX.match(line)
+    return line[m.end():] if m else line
+
+
 def parse_level(line: str) -> Optional[int]:
+    line = strip_archive_prefix(line)
     m = _TS_GLOG.match(line)
     if m:
         return _LETTER[m["lv"]]
