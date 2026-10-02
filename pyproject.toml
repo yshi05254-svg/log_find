@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logfind"
+version = "0.1.0"
+description = "健壮的日志/快照捕获、跟踪、检索与对比工具"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+toml = ["tomli; python_version < '3.11'"]
+numpy = ["numpy"]
+
+[project.scripts]
+logfind = "logfind.cli:main"
+
+[tool.setuptools]
+packages = ["logfind"]

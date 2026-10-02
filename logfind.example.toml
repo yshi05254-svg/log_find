@@ -1,0 +1,22 @@
+# logfind 配置文件。路径相对于本文件所在目录，支持 glob（** 递归）与 ~ / $ENV。
+home = ".logfind"          # 归档、快照、触发记录的存放目录
+max_segment = "16MB"       # 单个归档分段大小
+max_total = "1GB"          # 单个会话归档总上限（超出后删除最旧分段）
+keep_sessions = 100        # 最多保留多少个会话
+
+[profiles.mask]            # 面具模块
+logs = ["logs/mask/**/*.log", "/tmp/mask_*.log"]
+snapshots = ["out/mask/snapshots/*.json", "out/mask/*.npy"]
+triggers = ["ERROR", "Traceback", "Segmentation fault", "NaN"]
+command = ["python", "-m", "mask.main"]
+encoding = "auto"          # auto / utf-8 / gbk / utf-16 ...
+
+[profiles.vector]          # Vector 模块
+logs = ["logs/vector/*.log"]
+snapshots = ["out/vector/state/**/*"]
+triggers = ["(?i)error", "dimension mismatch", "nan"]
+trigger_before = 100
+trigger_after = 40
+
+[profiles.vector.env]
+RUST_BACKTRACE = "1"
