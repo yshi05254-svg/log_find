@@ -383,9 +383,11 @@ def cmd_snap(args) -> int:
         snaps = store.list(label)
         for i, s in enumerate(snaps):
             unstable = sum(1 for f in s.files.values() if not f.get("stable", True))
-            _out("%3d  %-44s %4d 文件 %8s%s%s" % (
+            unread = len(s.manifest.get("errors", []))
+            _out("%3d  %-44s %4d 文件 %8s%s%s%s" % (
                 i, s.id, len(s.files), _human(sum(f.get("size", 0) for f in s.files.values())),
                 color("33", "  不稳定:%d" % unstable) if unstable else "",
+                color("31", "  未读取:%d" % unread) if unread else "",
                 "  " + s.manifest.get("note", "") if s.manifest.get("note") else ""))
         if not snaps:
             print("没有快照", file=sys.stderr)
@@ -430,7 +432,7 @@ def cmd_snap(args) -> int:
                 continue
             changed += 1
             mark = {"added": color("32", "+ 新增"), "removed": color("31", "- 删除"),
-                    "changed": color("33", "~ 修改")}[d.status]
+                    "changed": color("33", "~ 修改"), "unreadable": color("35", "! 无法读取")}[d.status]
             _out("%s %s" % (mark, d.rel))
             for line in d.details:
                 if line.startswith("+") and not line.startswith("+++"):
@@ -474,8 +476,13 @@ def _print_snap_summary(snap, color) -> None:
     for rel, info in snap.files.items():
         flag = "" if info.get("stable", True) else color("33", "  [不稳定：文件一直在变化，内容可能不完整]")
         _out("  %-60s %8s%s" % (rel, _human(info["size"]), flag))
+    kinds = {"denied": "权限被拒绝", "unavailable": "设备不可用", "failed": "失败"}
     for e in snap.manifest.get("errors", []):
-        _out(color("31", "  失败 %s: %s" % (e["src"], e["error"])))
+        _out(color("31", "  %s %s: %s" % (kinds.get(e.get("kind"), "失败"), e["src"], e["error"])))
+    cov = snap.manifest.get("coverage")
+    if cov and cov.get("read", 0) < cov.get("total", 0):
+        parts = ["%s %d" % (kinds[k], cov[k]) for k in kinds if cov.get(k)]
+        _out(color("33", "  读取覆盖 %d/%d（%s）" % (cov["read"], cov["total"], "，".join(parts))))
 
 
 # ---------- init ----------

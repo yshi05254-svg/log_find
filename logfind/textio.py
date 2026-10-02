@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import bz2
 import codecs
+import errno
 import gzip
 import json
 import lzma
@@ -152,8 +153,32 @@ class LineSplitter:
             self._decoder.reset()
 
 
+# 设备/挂载级故障：整个读取通道不可用，重试单个文件没有意义
+_UNAVAILABLE_ERRNOS = frozenset(getattr(errno, n) for n in (
+    "EIO", "ENODEV", "ENXIO", "ENOTCONN", "ESTALE", "EHOSTDOWN", "EHOSTUNREACH",
+    "ENOMEDIUM", "EREMOTEIO", "ESHUTDOWN", "ECONNABORTED", "ETIMEDOUT") if hasattr(errno, n))
+
+
+def is_access_denied(e: BaseException) -> bool:
+    """持久性的权限拒绝（如 SELinux/AppArmor 策略、文件权限）。
+
+    Windows 下 PermissionError 多数是被其它进程独占的短暂状态，不算持久拒绝。
+    """
+    return (os.name != "nt" and isinstance(e, PermissionError)
+            and getattr(e, "errno", None) in (errno.EACCES, errno.EPERM))
+
+
+def is_source_unavailable(e: BaseException) -> bool:
+    """文件所在的设备/挂载整体不可用（I/O 错误、断开的网络盘/FUSE、拔出的介质等）。"""
+    return isinstance(e, OSError) and getattr(e, "errno", None) in _UNAVAILABLE_ERRNOS
+
+
+def is_persistent_error(e: BaseException) -> bool:
+    return is_access_denied(e) or is_source_unavailable(e)
+
+
 def _retry(fn: Callable, retries: int = 8, delay: float = 0.05):
-    """Windows 下文件被写入进程独占时会短暂 PermissionError，退避重试。"""
+    """Windows 下文件被写入进程独占时会短暂 PermissionError，退避重试；持久性错误直接抛出。"""
     last = None
     for i in range(retries):
         try:
@@ -161,6 +186,8 @@ def _retry(fn: Callable, retries: int = 8, delay: float = 0.05):
         except FileNotFoundError:
             raise
         except (PermissionError, BlockingIOError, InterruptedError) as e:
+            if is_persistent_error(e):
+                raise
             last = e
             time.sleep(delay * (2 ** min(i, 5)))
     raise last  # type: ignore[misc]
@@ -255,10 +282,14 @@ def read_stable(
     只有当 (大小, mtime) 连续两次一致、读到的长度与文件大小一致、并且 validator 通过时
     才认为读到的是完整内容。最近 `quiet` 秒内都没修改过的文件只需读一次。
     返回 (内容, 是否稳定)；多次尝试仍不稳定时返回最后一次读到的内容。
+    权限被拒绝（如 SELinux）、设备不可用等持久性错误立即抛出；
+    一次都没读成功时抛出最后的错误，而不是返回空内容冒充读取成功。
     """
     compressed = is_compressed(path)
     prev = None
     data = b""
+    read_ok = False
+    last_err: Optional[BaseException] = None
     for _ in range(max(1, attempts)):
         try:
             before = _sig(path)
@@ -267,11 +298,15 @@ def read_stable(
             after = _sig(path)
         except FileNotFoundError:
             raise
-        except (OSError, EOFError):
+        except (OSError, EOFError) as e:
+            if is_persistent_error(e):
+                raise
             # 压缩文件写了一半会 EOFError
+            last_err = e
             time.sleep(settle)
             prev = None
             continue
+        read_ok = True
         consistent = before == after and (compressed or before[0] == len(data))
         valid = consistent and (validator is None or validator(data))
         if valid:
@@ -280,6 +315,10 @@ def read_stable(
                 return data, True
         prev = after if consistent else None
         time.sleep(settle)
+    if not read_ok and last_err is not None:
+        if isinstance(last_err, OSError):
+            raise last_err
+        raise OSError(errno.EIO, "读取失败: %s" % last_err, path)
     return data, False
 
 

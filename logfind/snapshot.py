@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from .textio import (atomic_write, default_validator, looks_binary, read_bytes_as_text,
-                     read_stable)
+from .textio import (atomic_write, default_validator, is_access_denied, is_source_unavailable,
+                     looks_binary, read_bytes_as_text, read_stable)
 
 
 def _sha(data: bytes) -> str:
@@ -136,22 +136,35 @@ class SnapshotStore:
         snap_dir = self._new_dir(label)
         files: Dict[str, Dict[str, Any]] = {}
         errors = []
+        dead_devs: Dict[int, str] = {}  # 已确认整体不可用的设备 -> 首个错误
         for p in paths:
             rel = _rel_for(p)
+            st = None
             try:
                 st = os.stat(p)
+                if st.st_dev in dead_devs:
+                    errors.append({"src": os.path.abspath(p), "rel": rel, "kind": "unavailable",
+                                   "error": "所在设备不可用，已跳过（%s）" % dead_devs[st.st_dev]})
+                    continue
                 data, stable = read_stable(p, settle=settle, attempts=attempts,
                                            validator=(validator or default_validator)(p))
             except OSError as e:
-                errors.append({"src": os.path.abspath(p), "error": str(e)})
+                kind = _error_kind(e)
+                if kind == "unavailable" and st is not None:
+                    dead_devs[st.st_dev] = str(e)
+                errors.append({"src": os.path.abspath(p), "rel": rel, "kind": kind, "error": str(e)})
                 continue
             sha = _sha(data)
             self._store_file(snap_dir, rel, data, sha, prev)
             files[rel] = {"src": os.path.abspath(p), "size": len(data), "sha256": sha,
                           "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="milliseconds"),
                           "stable": stable}
+        coverage = {"total": len(paths), "read": len(files)}
+        for e in errors:
+            coverage[e["kind"]] = coverage.get(e["kind"], 0) + 1
         manifest = {"label": label, "note": note, "created": datetime.now().isoformat(timespec="milliseconds"),
-                    "patterns": list(patterns), "files": files, "errors": errors, "cwd": os.getcwd()}
+                    "patterns": list(patterns), "files": files, "errors": errors,
+                    "coverage": coverage, "cwd": os.getcwd()}
         atomic_write(os.path.join(snap_dir, "manifest.json"),
                      json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
         return Snapshot(snap_dir, manifest)
@@ -271,6 +284,14 @@ class SnapshotStore:
             time.sleep(interval)
 
 
+def _error_kind(e: OSError) -> str:
+    if is_access_denied(e):
+        return "denied"
+    if is_source_unavailable(e):
+        return "unavailable"
+    return "failed"
+
+
 def _numpy():
     try:
         import numpy  # noqa
@@ -300,8 +321,13 @@ def _json_default(o):
 @dataclass
 class FileDiff:
     rel: str
-    status: str  # added / removed / changed / same
+    status: str  # added / removed / changed / same / unreadable
     details: List[str] = field(default_factory=list)
+
+
+def _unread_map(snap: Snapshot) -> Dict[str, str]:
+    """快照拍摄时读取失败的文件：rel -> 错误信息。"""
+    return {e["rel"]: e.get("error", "") for e in snap.manifest.get("errors", []) if e.get("rel")}
 
 
 def _is_num(x) -> bool:
@@ -455,6 +481,7 @@ def diff_snapshots(a: Snapshot, b: Optional[Snapshot], tol: float = 0.0, context
                    only: Optional[List[str]] = None) -> List[FileDiff]:
     """对比两个快照；b 为 None 时与磁盘上的当前文件（live）对比。"""
     result: List[FileDiff] = []
+    a_err = _unread_map(a)
     if b is None:
         b_files = {}
         for rel, info in a.files.items():
@@ -464,22 +491,35 @@ def diff_snapshots(a: Snapshot, b: Optional[Snapshot], tol: float = 0.0, context
         get_b = lambda rel: read_stable(b_files[rel], validator=default_validator(rel))[0]  # noqa: E731
         b_keys = set(b_files)
         b_name = "live"
+        b_err: Dict[str, str] = {}
     else:
         get_b = b.read
         b_keys = set(b.files)
         b_name = b.id
+        b_err = _unread_map(b)
     keys = sorted(set(a.files) | b_keys)
     if only:
         keys = [k for k in keys if any(o.replace("\\", "/") in k for o in only)]
     for rel in keys:
+        # 某一侧拍摄时没读到（权限被拒、设备不可用），不能当成新增/删除
         if rel not in b_keys:
-            result.append(FileDiff(rel, "removed"))
+            if rel in b_err:
+                result.append(FileDiff(rel, "unreadable", ["%s 中未能读取: %s" % (b_name, b_err[rel])]))
+            else:
+                result.append(FileDiff(rel, "removed"))
             continue
         if rel not in a.files:
-            result.append(FileDiff(rel, "added"))
+            if rel in a_err:
+                result.append(FileDiff(rel, "unreadable", ["%s 中未能读取: %s" % (a.id, a_err[rel])]))
+            else:
+                result.append(FileDiff(rel, "added"))
             continue
         da = a.read(rel)
-        db = get_b(rel)
+        try:
+            db = get_b(rel)
+        except OSError as e:
+            result.append(FileDiff(rel, "unreadable", ["%s 中未能读取: %s" % (b_name, e)]))
+            continue
         if b is not None and a.files[rel].get("sha256") == b.files[rel].get("sha256"):
             result.append(FileDiff(rel, "same"))
             continue

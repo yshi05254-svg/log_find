@@ -1,3 +1,4 @@
+import errno
 import gzip
 import io
 import json
@@ -12,6 +13,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -377,7 +379,7 @@ class InprocTests(TmpDir):
             self.assertIn(want, body)
 
 
-class SnapshotTests(TmpDir):
+class SnapshotStoreCase(TmpDir):
     def setUp(self):
         super().setUp()
         self.cwd = os.getcwd()
@@ -388,6 +390,8 @@ class SnapshotTests(TmpDir):
         os.chdir(self.cwd)
         super().tearDown()
 
+
+class SnapshotTests(SnapshotStoreCase):
     def test_take_diff_live_and_hardlink(self):
         self.write("out/state.json", json.dumps({"step": 1, "vec": [0.0] * 32, "name": "m"}))
         self.write("out/log.txt", "a\nb\n")
@@ -445,6 +449,64 @@ class SnapshotTests(TmpDir):
         t.join()
         self.assertEqual(len(seen), 2)
         self.assertIn('"v": 2', seen[-1].read("w/data.json").decode())
+
+
+def _failing_open(match, err_no, calls=None):
+    """替换 textio 里的 open：路径包含 match 时抛出指定 errno（模拟 SELinux 拒绝、设备 I/O 错误）。"""
+    real = open
+
+    def fake(path, *a, **kw):
+        if match in str(path):
+            if calls is not None:
+                calls.append(str(path))
+            raise OSError(err_no, os.strerror(err_no), str(path))
+        return real(path, *a, **kw)
+    return mock.patch("logfind.textio.open", fake, create=True)
+
+
+@unittest.skipIf(os.name == "nt", "Windows 下 PermissionError 视为短暂占用")
+class SnapshotReadCoverageTests(SnapshotStoreCase):
+    def test_selinux_denied_is_error_not_empty_file(self):
+        self.write("out/ok.json", '{"a": 1}')
+        self.write("out/denied.json", '{"b": 2}')
+        t = time.time()
+        with _failing_open("denied", errno.EACCES):
+            snap = self.store.take(["out"])
+        self.assertLess(time.time() - t, 2.0)  # 不再对持久拒绝反复重试
+        self.assertEqual(list(snap.files), ["out/ok.json"])
+        [err] = snap.manifest["errors"]
+        self.assertEqual((err["rel"], err["kind"]), ("out/denied.json", "denied"))
+        self.assertEqual(snap.manifest["coverage"], {"total": 2, "read": 1, "denied": 1})
+
+    def test_unavailable_device_fails_fast_for_remaining_files(self):
+        for i in range(3):
+            self.write("dead/f%d.txt" % i, "x")
+        calls = []
+        with _failing_open("dead", errno.EIO, calls):
+            snap = self.store.take(["dead"])
+        self.assertEqual(snap.files, {})
+        # 只有第一个文件真正尝试读取，其余同设备文件直接跳过
+        self.assertEqual({os.path.basename(c) for c in calls}, {"f0.txt"})
+        kinds = [e["kind"] for e in snap.manifest["errors"]]
+        self.assertEqual(kinds, ["unavailable"] * 3)
+        self.assertIn("已跳过", snap.manifest["errors"][2]["error"])
+
+    def test_diff_marks_unreadable_instead_of_added_or_removed(self):
+        self.write("out/a.txt", "1\n")
+        self.write("out/b.txt", "1\n")
+        with _failing_open("b.txt", errno.EACCES):
+            s1 = self.store.take(["out"])
+        s2 = self.store.take(["out"])
+        diffs = {d.rel: d.status for d in diff_snapshots(s1, s2)}
+        self.assertEqual(diffs, {"out/a.txt": "same", "out/b.txt": "unreadable"})
+        with _failing_open("a.txt", errno.EACCES):
+            live = {d.rel: d.status for d in diff_snapshots(s2, None)}
+        self.assertEqual(live, {"out/a.txt": "unreadable", "out/b.txt": "same"})
+
+    def test_read_stable_raises_when_never_read(self):
+        path = self.write("busy.txt", "x")
+        with _failing_open("busy", errno.EBUSY), self.assertRaises(OSError):
+            textio.read_stable(path, settle=0.01, attempts=3)
 
 
 class CliTests(TmpDir):
