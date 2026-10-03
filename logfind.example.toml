@@ -20,3 +20,12 @@ trigger_after = 40
 
 [profiles.vector.env]
 RUST_BACKTRACE = "1"
+
+[android]                  # 面具模块开机日志（logfind android script / status / pull）
+log_dir = "/data/local/tmp/ven11/log"
+name = "boot.log"
+rotate_size = "16M"        # logcat -r
+count = 3                  # logcat -n
+format = "time"            # logcat -v
+# buffers = ["main", "system", "crash"]   # 不写则用 logcat 默认缓冲区
+# serial = "emulator-5554"

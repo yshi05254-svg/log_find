@@ -24,6 +24,14 @@ PRESETS = {
     ],
     "error": [r"(?i)\b(error|err|fatal|critical|fail(ed|ure)?|exception)\b"],
     "warn": [r"(?i)\b(warn(ing)?|deprecated)\b"],
+    # Android 开机/运行时崩溃：Java 崩溃、native tombstone、ANR、system_server 看门狗
+    "android": [
+        r"FATAL EXCEPTION", r"AndroidRuntime", r"Fatal signal \d+", r"\*\*\* \*\*\* \*\*\*",
+        r"Abort message", r"\bbacktrace:", r"\bANR in\b", r"Application Not Responding",
+        r"\bWATCHDOG\b|Watchdog.*(killing|Blocked)", r"has died", r"beginning of crash",
+        r"\bSIGSEGV\b|\bSIGABRT\b", r"UnsatisfiedLinkError", r"ClassNotFoundException",
+        r"NoSuchMethod(Error|Exception)", r"avc: +denied",
+    ],
 }
 
 LOG_EXTS = (".log", ".txt", ".out", ".err", ".jsonl", ".gz", ".bz2", ".xz", ".csv", ".trace")

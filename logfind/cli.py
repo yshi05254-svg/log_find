@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+from datetime import datetime
 from typing import List, Optional
 
 from . import __version__
@@ -215,10 +216,15 @@ def cmd_grep(args) -> int:
     if args.session:
         for ref in args.session:
             files += resolve_session(cfg.home, ref).segments()
-    files += expand_paths(pos or ([] if args.session else (prof.logs if prof else [])),
+    if args.android:
+        from .android import pull_files, resolve_pull
+        for ref in args.android:
+            files += pull_files(resolve_pull(cfg.home, ref))
+    extra_src = bool(args.session or args.android)
+    files += expand_paths(pos or ([] if extra_src else (prof.logs if prof else [])),
                           rotated=not args.no_rotated)
     if not files:
-        print("logfind grep: 没有可搜索的文件（指定路径、-p profile 或 --session）", file=sys.stderr)
+        print("logfind grep: 没有可搜索的文件（指定路径、-p profile、--session 或 --android）", file=sys.stderr)
         return 2
 
     matcher = Matcher(patterns, fixed=args.fixed, ignore_case=args.ignore_case, invert=args.invert,
@@ -229,7 +235,7 @@ def cmd_grep(args) -> int:
     before = args.before if args.before is not None else args.context
     after = args.after if args.after is not None else args.context
     color = Color(_color_enabled(args.color))
-    show_name = len(files) > 1 or bool(args.session)
+    show_name = len(files) > 1 or extra_src
     count = 0
     last_key = None
     per_file = {}
@@ -478,6 +484,78 @@ def _print_snap_summary(snap, color) -> None:
         _out(color("31", "  失败 %s: %s" % (e["src"], e["error"])))
 
 
+# ---------- android ----------
+def _boot_spec(args, cfg: Config):
+    from .android import BootLogSpec, size_to_kb
+    a = cfg.android
+    return BootLogSpec(
+        log_dir=args.dir or a.log_dir, name=args.log_name or a.name,
+        rotate_kb=size_to_kb(args.size or a.rotate_size),
+        count=args.count if args.count is not None else a.count,
+        fmt=args.format or a.format, buffers=list(args.buffer or a.buffers)).validate()
+
+
+def _adb(args, cfg: Config):
+    from .android import Adb
+    return Adb(serial=args.serial or cfg.android.serial, adb=args.adb or cfg.android.adb)
+
+
+def cmd_android(args) -> int:
+    from . import android
+    cfg = _cfg(args)
+    color = Color(_color_enabled(args.color))
+    act = args.android_cmd
+
+    if act == "list":
+        pulls = android.list_pulls(cfg.home)
+        for i, d in enumerate(pulls):
+            files = android.pull_files(d)
+            _out("%3d  %-36s %2d 文件 %8s" % (i, os.path.basename(d), len(files),
+                                             _human(sum(os.path.getsize(f) for f in files))))
+        if not pulls:
+            print("还没有拉取过设备日志（logfind android pull）", file=sys.stderr)
+        return 0
+
+    spec = _boot_spec(args, cfg)
+    if act == "script":
+        if not args.output:
+            sys.stdout.write(android.render_script(spec))
+            return 0
+        path, action = android.install_script(args.output, spec)
+        msg = {"created": "已生成", "updated": "已更新其中的开机日志段", "inserted": "已插入开机日志段",
+               "unchanged": "内容无变化"}[action]
+        print("%s %s%s" % (msg, path, "（原文件备份为 .bak）" if action in ("updated", "inserted") else ""))
+        return 0
+
+    adb = _adb(args, cfg)
+    if act == "status":
+        adb.check_device()
+        pids = android.logcat_pids(adb, spec)
+        _, boot = adb.shell("getprop sys.boot_completed")
+        _out("设备日志: %s" % spec.remote_path)
+        _out("常驻 logcat: %s" % (color("32", "运行中 pid=" + ",".join(map(str, pids))) if pids
+                                  else color("31", "未运行（模块未启用/未重启，或脚本没生效）")))
+        _out("开机完成: %s" % ("是" if boot.strip() == "1" else "否"))
+        files = android.list_remote(adb, spec)
+        for f in files:
+            _out("  %-16s %8s  %s" % (f.name, _human(f.size),
+                                      datetime.fromtimestamp(f.mtime).strftime("%Y-%m-%d %H:%M:%S")))
+        if not files:
+            _out(color("33", "  （目录中没有日志文件）"))
+        return 0 if pids else 1
+
+    if act == "pull":
+        def log(info):
+            print("[logfind] %-16s %8s  %s" % (info["name"], _human(info["size"]),
+                                              "adb pull" if info["method"] == "pull" else "su cat"),
+                  file=sys.stderr)
+        out_dir, _ = android.pull(adb, spec, cfg.home, out_dir=args.output, log=log)
+        _out(out_dir)
+        print("[logfind] 检索示例: logfind grep --android latest --preset android", file=sys.stderr)
+        return 0
+    return 2
+
+
 # ---------- init ----------
 def cmd_init(args) -> int:
     path = args.output
@@ -559,6 +637,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-l", "--level", help="最低级别 debug/info/warn/error/fatal")
     p.add_argument("-s", "--session", action="append", metavar="REF",
                    help="搜索 logfind 会话归档（latest / prev / -3 / ID 前缀）")
+    p.add_argument("--android", action="append", metavar="REF",
+                   help="搜索 logfind android pull 拉回的设备日志（latest / prev / -3 / ID 前缀）")
     p.add_argument("--no-rotated", action="store_true", help="不自动包含 app.log.1 / .gz 等滚动文件")
     p.add_argument("--single-line", action="store_true", help="不合并多行记录")
     p.add_argument("--max-lines", type=int, default=60, help="单条记录最多显示行数（0 不限）")
@@ -617,6 +697,28 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("-L", "--label")
     p.set_defaults(func=cmd_snap)
 
+    dev = argparse.ArgumentParser(add_help=False)
+    dev.add_argument("--dir", help="设备上的日志目录（默认 /data/local/tmp/ven11/log）")
+    dev.add_argument("--log-name", help="日志文件名（默认 boot.log）")
+    dev.add_argument("--size", help="单个文件轮转大小，如 16M / 8192（KB）")
+    dev.add_argument("--count", type=int, help="保留的轮转文件数（logcat -n，默认 3）")
+    dev.add_argument("--format", help="logcat -v 格式（默认 time）")
+    dev.add_argument("-b", "--buffer", action="append", help="logcat 缓冲区（可多次，如 main/system/crash/all）")
+    adbp = argparse.ArgumentParser(add_help=False)
+    adbp.add_argument("-s", "--serial", help="adb 设备序列号")
+    adbp.add_argument("--adb", help="adb 可执行文件路径")
+    p = sub.add_parser("android", help="面具模块开机日志：生成常驻 logcat 脚本、查看状态、拉回本地")
+    sa = p.add_subparsers(dest="android_cmd", metavar="<动作>")
+    q = sa.add_parser("script", parents=[common, dev],
+                      help="生成 post-fs-data 常驻 logcat 脚本，或合并进模块的 post-fs-data.sh",
+                      description="例: logfind android script -o my_module/   （写入/更新 my_module/post-fs-data.sh）")
+    q.add_argument("-o", "--output", help="输出文件或模块目录；已有脚本时只插入/更新标记段并备份 .bak；不指定则打印")
+    q = sa.add_parser("status", parents=[common, dev, adbp], help="检查设备上常驻 logcat 是否在运行、日志文件大小")
+    q = sa.add_parser("pull", parents=[common, dev, adbp], help="把设备日志（含轮转文件）拉到本地 <home>/android/")
+    q.add_argument("-o", "--output", help="保存目录（默认 <home>/android/<时间>_<设备>）")
+    q = sa.add_parser("list", parents=[common], help="列出已拉取的设备日志")
+    p.set_defaults(func=cmd_android)
+
     p = sub.add_parser("init", help="在当前目录生成 logfind.toml 示例配置")
     p.add_argument("-o", "--output", default="logfind.toml")
     p.add_argument("--force", action="store_true")
@@ -628,10 +730,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     _fix_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not getattr(args, "func", None) or (args.command == "snap" and not args.snap_cmd):
-        parser.print_help() if not getattr(args, "func", None) else \
-            parser.parse_args(["snap", "-h"])
+    if not getattr(args, "func", None):
+        parser.print_help()
         return 2
+    for group, attr in (("snap", "snap_cmd"), ("android", "android_cmd")):
+        if args.command == group and not getattr(args, attr):
+            parser.parse_args([group, "-h"])
+            return 2
     try:
         return args.func(args)
     except (LookupError, ValueError, RuntimeError) as e:

@@ -57,6 +57,19 @@ class Profile:
 
 
 @dataclass
+class AndroidConfig:
+    """[android] 段：设备上常驻 logcat 的位置与轮转参数（见 logfind android）。"""
+    log_dir: str = "/data/local/tmp/ven11/log"
+    name: str = "boot.log"
+    rotate_size: str = "16M"
+    count: int = 3
+    format: str = "time"
+    buffers: List[str] = field(default_factory=list)
+    serial: Optional[str] = None
+    adb: str = "adb"
+
+
+@dataclass
 class Config:
     path: Optional[str] = None
     home: str = ".logfind"
@@ -64,6 +77,7 @@ class Config:
     max_segment: str = "16MB"
     max_total: str = "1GB"
     keep_sessions: int = 100
+    android: AndroidConfig = field(default_factory=AndroidConfig)
 
     def profile(self, name: Optional[str]) -> Optional[Profile]:
         if not name:
@@ -99,6 +113,17 @@ def load_config(path: Optional[str] = None) -> Config:
     cfg.max_segment = raw.get("max_segment", cfg.max_segment)
     cfg.max_total = raw.get("max_total", cfg.max_total)
     cfg.keep_sessions = int(raw.get("keep_sessions", cfg.keep_sessions))
+    a = raw.get("android") or {}
+    cfg.android = AndroidConfig(
+        log_dir=str(a.get("log_dir", AndroidConfig.log_dir)),
+        name=str(a.get("name", AndroidConfig.name)),
+        rotate_size=str(a.get("rotate_size", AndroidConfig.rotate_size)),
+        count=int(a.get("count", AndroidConfig.count)),
+        format=str(a.get("format", AndroidConfig.format)),
+        buffers=_as_list(a.get("buffers")),
+        serial=a.get("serial") or None,
+        adb=str(a.get("adb", AndroidConfig.adb)),
+    )
     for name, p in (raw.get("profiles") or {}).items():
         cfg.profiles[name] = Profile(
             name=name,
@@ -144,4 +169,13 @@ trigger_after = 40
 
 [profiles.vector.env]
 RUST_BACKTRACE = "1"
+
+[android]                  # 面具模块开机日志（logfind android script / status / pull）
+log_dir = "/data/local/tmp/ven11/log"
+name = "boot.log"
+rotate_size = "16M"        # logcat -r
+count = 3                  # logcat -n
+format = "time"            # logcat -v
+# buffers = ["main", "system", "crash"]   # 不写则用 logcat 默认缓冲区
+# serial = "emulator-5554"
 '''

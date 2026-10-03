@@ -47,6 +47,8 @@ _LEVEL_WORD = re.compile(
 )
 _LEVEL_LOGCAT = re.compile(r"^\S+\s+\S+\s+\d+\s+\d+\s+([VDIWEFA])\s")
 _LEVEL_LOGCAT_BRIEF = re.compile(r"^([VDIWEFA])/[^\s(]+\s*\(")
+# logcat -v time / -v year: 10-02 20:22:01.123 E/Tag( 1234): msg
+_LEVEL_LOGCAT_TIME = re.compile(r"^(?:\d{4}-)?\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+([VDIWEFA])/")
 
 
 def _frac(f: Optional[str]) -> int:
@@ -86,7 +88,7 @@ def parse_level(line: str) -> Optional[int]:
     m = _TS_GLOG.match(line)
     if m:
         return _LETTER[m["lv"]]
-    m = _LEVEL_LOGCAT.match(line) or _LEVEL_LOGCAT_BRIEF.match(line)
+    m = _LEVEL_LOGCAT.match(line) or _LEVEL_LOGCAT_TIME.match(line) or _LEVEL_LOGCAT_BRIEF.match(line)
     if m:
         return _LETTER[m.group(1)]
     m = _LEVEL_WORD.search(line[:96])

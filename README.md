@@ -49,6 +49,53 @@ logfind snap watch out/vector/ -i 0.5 # 文件一变化就自动快照（未变�
 logfind snap show prev state.json
 ```
 
+## 面具模块：开机日志（post-fs-data 常驻 logcat）
+
+开机早期（zygote / system_server 起来之前、框架侧装钩的那段时间）的日志，等开机后再 `adb logcat` 往往已经被环形缓冲区冲掉了。
+`logfind android` 把“post-fs-data 阶段启动常驻 logcat 写文件”这一套做成了命令：
+
+```bash
+# 1. 生成脚本并写进模块：没有 post-fs-data.sh 就新建；已有的话只插入/更新一段带标记的代码
+#    （插在末尾 exit 之前，原文件备份为 .bak，统一转成 LF 换行，重复执行不会重复插入）
+logfind android script -o my_module/
+logfind android script                       # 只打印脚本
+logfind android script -o my_module/ --size 32M --count 5 -b all   # 调整轮转/缓冲区
+
+# 2. 刷入模块、重启后检查：常驻 logcat 是否在跑、日志文件大小
+logfind android status
+
+# 3. 拉回本地（含 boot.log.1、boot.log.2 等轮转文件，保留设备上的修改时间）
+#    logcat 以 root 创建的文件 shell 用户读不了，adb pull 失败时会自动改用 su 读取
+logfind android pull                         # -> .logfind/android/<时间>_<设备>/
+logfind android list
+
+# 4. 检索（最旧的轮转文件排在前面，按时间顺序阅读）
+logfind grep --android latest --preset android          # Java 崩溃 / native tombstone / ANR / avc denied ...
+logfind grep --android latest -l error "MyHook|LSPosed"
+logfind grep --android prev -C 5 "Fatal signal"
+```
+
+生成的脚本（默认值与原来手写的 ven11 脚本一致）：
+
+```sh
+#!/system/bin/sh
+# >>> logfind bootlog >>>
+# 由 logfind android script 生成，重复执行会原地更新这一段。
+# 常驻 logcat，post-fs-data 阶段启动（早于 zygote/system_server），
+# 完整记录含框架侧装钩在内的开机窗口；16M×3 轮转防写爆 /data。
+BOOTLOG_DIR=/data/local/tmp/ven11/log
+mkdir -p "$BOOTLOG_DIR"
+chmod 777 "$BOOTLOG_DIR"
+if ! pgrep -f "$BOOTLOG_DIR/boot.log" >/dev/null 2>&1; then
+  /system/bin/logcat -v time -f "$BOOTLOG_DIR/boot.log" -r 16384 -n 3 >/dev/null 2>&1 &
+fi
+# <<< logfind bootlog <<<
+exit 0
+```
+
+目录、文件名、轮转大小/个数、格式、缓冲区、设备序列号都可以在命令行（`--dir --log-name --size --count --format -b -s`）或配置文件的 `[android]` 段里改。
+`-v time` 和 `-v threadtime` 格式的级别、时间都能识别，`-l error` 不会把正文里含 “Error” 的 I 级别日志误算进来。
+
 ## 配置文件（按模块分 profile）
 
 运行 `logfind init` 生成 `logfind.toml`（完整示例见 [logfind.example.toml](logfind.example.toml)）：
@@ -113,6 +160,7 @@ for hit in search(expand_paths(["logs/"], rotated=True), Matcher(["dimension"]),
 
 ```
 .logfind/
+├── android/<时间>_<设备>/          # logfind android pull：boot.log、boot.log.1 ... 和 meta.json
 ├── sessions/<时间>_<名字>/
 │   ├── meta.json                 # 命令、工作目录、退出码/信号、耗时、各流行数
 │   ├── seg-000001.log            # 归档：2026-10-02T20:22:01.123 [stderr] 文本
@@ -134,6 +182,7 @@ for hit in search(expand_paths(["logs/"], rotated=True), Matcher(["dimension"]),
 | `grep [PATTERN] [PATHS] [-e RE] [-C N] [--since] [--until] [-l LEVEL] [-s SESSION] [--json]` | 检索 |
 | `sessions [--prune KEEP]` / `show [REF] [--stream] [-n] [--meta]` / `hits [REF] [--cat]` | 会话管理 |
 | `snap take/list/show/diff/watch/prune` | 快照 |
+| `android script/status/pull/list` | 面具模块开机日志：生成/合并 post-fs-data 常驻 logcat 脚本，查看状态，拉回本地；`grep --android REF` 检索 |
 | `init` | 生成示例配置 |
 
 会话和快照的引用写法：`latest`、`prev`、`-3`（倒数第 3 个）、ID 前缀。

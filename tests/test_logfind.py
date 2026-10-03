@@ -120,6 +120,9 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(parse_level("E1001 08:00:00.000100 12 a.cc:3] boom"), 40)
         self.assertEqual(parse_level("10-01 08:00:00.001  12  34 W Tag: x"), 30)
         self.assertEqual(parse_level("I/Mask( 123): hi"), 20)
+        # logcat -v time：级别字母在时间之后，正文里的 Error 不能把 I 级别误判成 ERROR
+        self.assertEqual(parse_level("10-01 08:00:00.001 E/Zygote( 123): boom"), 40)
+        self.assertEqual(parse_level("10-01 08:00:00.001 I/Zygote( 123): Error-free"), 20)
         self.assertIsNone(parse_level("plain text"))
 
     def test_time_spec(self):
@@ -504,6 +507,144 @@ class CliTests(TmpDir):
         rc, out = self.cli("grep", "--config", cfg, "--color", "never", "-p", "vector", "nan")
         self.assertEqual(rc, 0)
         self.assertIn("vector nan", out)
+
+
+FAKE_ADB = r"""#!/usr/bin/env python3
+import os, shutil, subprocess, sys
+a = sys.argv[1:]
+if a[:1] == ["-s"]:
+    a = a[2:]
+if a[0] == "get-state":
+    print("device"); sys.exit(0)
+if a[0] in ("shell", "exec-out"):
+    p = subprocess.run(["sh", "-c", a[1]])
+    sys.exit(p.returncode)
+if a[0] == "pull":
+    if os.environ.get("FAKE_PULL_DENIED"):
+        print("adb: error: failed to stat remote object: Permission denied", file=sys.stderr); sys.exit(1)
+    shutil.copy(a[1], a[2]); sys.exit(0)
+sys.exit(1)
+"""
+
+
+@unittest.skipIf(os.name == "nt", "需要 POSIX sh")
+class AndroidTests(TmpDir):
+    def setUp(self):
+        super().setUp()
+        from logfind import android
+        self.android = android
+        self.bin = self.p("bin")
+        os.makedirs(self.bin)
+        for name, body in (("adb", FAKE_ADB), ("su", '#!/bin/sh\n[ "$1" = "-c" ] && shift\nexec sh -c "$1"\n'),
+                           ("getprop", "#!/bin/sh\necho 1\n")):
+            path = os.path.join(self.bin, name)
+            with open(path, "w") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        self.old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.bin + os.pathsep + self.old_path
+        self.dev = self.p("dev", "log")
+        os.makedirs(self.dev)
+
+    def tearDown(self):
+        os.environ["PATH"] = self.old_path
+        os.environ.pop("FAKE_PULL_DENIED", None)
+        super().tearDown()
+
+    def test_script_matches_and_is_valid_sh(self):
+        spec = self.android.BootLogSpec()
+        text = self.android.render_script(spec)
+        self.assertIn('/system/bin/logcat -v time -f "$BOOTLOG_DIR/boot.log" -r 16384 -n 3', text)
+        self.assertIn("BOOTLOG_DIR=/data/local/tmp/ven11/log", text)
+        self.assertIn("16M×3", text)
+        path = self.write("s.sh", text)
+        self.assertEqual(subprocess.run(["sh", "-n", path]).returncode, 0)
+        spec = self.android.BootLogSpec(rotate_kb=self.android.size_to_kb("8M"), count=5, buffers=["all"])
+        self.assertIn("-v time -b all -f", self.android.render_block(spec))
+        self.assertIn("-r 8192 -n 5", self.android.render_block(spec))
+        for bad in (dict(log_dir="data/x"), dict(log_dir="/data/x'; rm -rf /"), dict(name="a b"),
+                    dict(fmt="time;id")):
+            with self.assertRaises(ValueError):
+                self.android.BootLogSpec(**bad).validate()
+
+    def test_install_merges_into_existing_module_script(self):
+        mod = self.p("module")
+        os.makedirs(mod)
+        orig = "\ufeff#!/system/bin/sh\r\nMODDIR=${0%/*}\r\necho hi > /dev/null\r\n\r\nexit 0\r\n"
+        self.write("module/post-fs-data.sh", orig, newline="")
+        path, action = self.android.install_script(mod, self.android.BootLogSpec())
+        self.assertEqual(action, "inserted")
+        with open(path, "rb") as fh:
+            data = fh.read().decode("utf-8")
+        self.assertNotIn("\r", data)
+        self.assertTrue(data.startswith("#!/system/bin/sh\nMODDIR"))
+        self.assertLess(data.index(self.android.MARK_END), data.rindex("exit 0"))  # 在 exit 之前才会执行
+        self.assertTrue(os.path.exists(path + ".bak"))
+        # 重复执行：原地更新，不会重复插入
+        path, action = self.android.install_script(mod, self.android.BootLogSpec(count=5))
+        self.assertEqual(action, "updated")
+        with open(path, encoding="utf-8") as fh:
+            data = fh.read()
+        self.assertEqual(data.count(self.android.MARK_BEGIN), 1)
+        self.assertIn("-n 5", data)
+        self.assertEqual(self.android.install_script(mod, self.android.BootLogSpec(count=5))[1], "unchanged")
+        # 新文件
+        path, action = self.android.install_script(self.p("new.sh"), self.android.BootLogSpec())
+        self.assertEqual(action, "created")
+        self.assertEqual(subprocess.run(["sh", "-n", path]).returncode, 0)
+
+    def _device_logs(self):
+        self.write("dev/log/boot.log.2", "10-03 08:00:00.000 I/init(    1): old boot\n")
+        self.write("dev/log/boot.log.1", "10-03 08:00:01.000 E/AndroidRuntime( 99): FATAL EXCEPTION: main\n")
+        self.write("dev/log/boot.log", "10-03 08:00:02.000 I/Zygote( 77): Error-free line\n")
+        self.write("dev/log/unrelated.txt", "x\n")
+        for i, n in enumerate(("boot.log.2", "boot.log.1", "boot.log")):
+            t = datetime(2026, 10, 3, 8, 0, i).timestamp()
+            os.utime(os.path.join(self.dev, n), (t, t))
+
+    def test_pull_with_su_fallback_and_grep(self):
+        self._device_logs()
+        os.environ["FAKE_PULL_DENIED"] = "1"
+        rc, out = CliTests.cli(self, "android", "pull", "--home", self.home, "--dir", self.dev, "-s", "emu-1")
+        self.assertEqual(rc, 0)
+        out_dir = out.strip()
+        self.assertTrue(os.path.basename(out_dir).endswith("_emu-1"))
+        self.assertEqual(sorted(os.listdir(out_dir)), ["boot.log", "boot.log.1", "boot.log.2", "meta.json"])
+        with open(os.path.join(out_dir, "meta.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+        self.assertEqual({f["method"] for f in meta["files"]}, {"su"})
+        self.assertEqual(int(os.path.getmtime(os.path.join(out_dir, "boot.log.2"))),
+                         int(datetime(2026, 10, 3, 8, 0, 0).timestamp()))
+        # 检索：最旧的轮转文件在前；级别过滤不会把 I 级别里的 Error 算进去
+        rc, out = CliTests.cli(self, "grep", "--home", self.home, "--color", "never", "--android", "latest",
+                               "-l", "error", ".")
+        self.assertEqual(rc, 0)
+        self.assertIn("FATAL EXCEPTION", out)
+        self.assertNotIn("Error-free", out)
+        rc, out = CliTests.cli(self, "grep", "--home", self.home, "--color", "never", "--android", "latest",
+                               "--json", "boot|FATAL|Error")
+        self.assertEqual([json.loads(l)["path"].rsplit(os.sep, 1)[1] for l in out.splitlines()],
+                         ["boot.log.2", "boot.log.1", "boot.log"])
+        rc, out = CliTests.cli(self, "android", "list", "--home", self.home)
+        self.assertIn("3 文件", out)
+
+    def test_status(self):
+        self._device_logs()
+        rc, out = CliTests.cli(self, "android", "status", "--home", self.home, "--color", "never",
+                               "--dir", self.dev)
+        self.assertEqual(rc, 1)  # 没有常驻 logcat
+        self.assertIn("未运行", out)
+        self.assertIn("boot.log.2", out)
+        self.assertNotIn("unrelated", out)
+        holder = subprocess.Popen(["sh", "-c", "sleep 30 # %s/boot.log" % self.dev])
+        try:
+            rc, out = CliTests.cli(self, "android", "status", "--home", self.home, "--color", "never",
+                                   "--dir", self.dev)
+            self.assertEqual(rc, 0)
+            self.assertIn("运行中", out)
+        finally:
+            holder.kill()
+            holder.wait()
 
 
 if __name__ == "__main__":
